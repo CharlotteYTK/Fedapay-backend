@@ -23,6 +23,7 @@ const serviceAccount = {
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
+  databaseURL: process.env.FIREBASE_DATABASE_URL,
 });
 
 // 🔥 Realtime Database (IMPORTANT)
