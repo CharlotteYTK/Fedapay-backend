@@ -3,28 +3,54 @@ const cors = require("cors");
 const fetch = require("node-fetch");
 const admin = require("firebase-admin");
 
-// FIREBASE (RENDER SAFE)
+// =========================
+// FIREBASE INIT (RENDER SAFE)
+// =========================
+
+if (
+  !process.env.FIREBASE_PROJECT_ID ||
+  !process.env.FIREBASE_CLIENT_EMAIL ||
+  !process.env.FIREBASE_PRIVATE_KEY
+) {
+  throw new Error("Firebase environment variables missing");
+}
+
+const serviceAccount = {
+  projectId: process.env.FIREBASE_PROJECT_ID,
+  clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+  privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n"),
+};
+
 admin.initializeApp({
-  credential: admin.credential.cert({
-    projectId: process.env.FIREBASE_PROJECT_ID,
-    clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-    privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n"),
-  }),
+  credential: admin.credential.cert(serviceAccount),
 });
 
-const db = admin.firestore();
+// 🔥 Realtime Database (IMPORTANT)
+const db = admin.database();
+
+// =========================
+// APP INIT
+// =========================
 
 const app = express();
+
 app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 const FEDAPAY_SECRET = process.env.FEDAPAY_SECRET;
 
+// =========================
 // CREATE PAYMENT
+// =========================
+
 app.post("/create-payment", async (req, res) => {
   try {
     const { amount, email, name, orderId } = req.body;
+
+    if (!amount || !email || !orderId) {
+      return res.status(400).json({ error: "Missing fields" });
+    }
 
     const response = await fetch(
       "https://api.fedapay.com/v1/transactions",
@@ -38,15 +64,14 @@ app.post("/create-payment", async (req, res) => {
           description: `Commande ${orderId}`,
           amount,
           currency: { iso: "XOF" },
-
           callback_url: "https://fedapay-backend-1.onrender.com/webhook",
-
           customer: {
-            firstname: name,
+            firstname: name || "Client",
             email,
           },
-
-          metadata: { orderId },
+          metadata: {
+            orderId,
+          },
         }),
       }
     );
@@ -56,9 +81,18 @@ app.post("/create-payment", async (req, res) => {
     const transaction =
       data?.v1?.transaction || data?.transaction;
 
-    if (!transaction) return res.status(500).json(data);
+    if (!transaction) {
+      return res.status(500).json({
+        error: "Transaction creation failed",
+        data,
+      });
+    }
 
     const transactionId = transaction.id;
+
+    // =========================
+    // GET PAYMENT TOKEN
+    // =========================
 
     const tokenResponse = await fetch(
       `https://api.fedapay.com/v1/transactions/${transactionId}/token`,
@@ -73,26 +107,43 @@ app.post("/create-payment", async (req, res) => {
 
     const tokenData = await tokenResponse.json();
 
-    await db.collection("orders").doc(orderId).set({
+    if (!tokenData?.url) {
+      return res.status(500).json({
+        error: "Payment URL not generated",
+      });
+    }
+
+    // =========================
+    // SAVE ORDER (Realtime DB)
+    // =========================
+
+    await db.ref("orders/" + orderId).set({
       orderId,
       amount,
       email,
       status: "pending",
       transactionId,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      createdAt: Date.now(),
     });
 
-    res.json({ payment_url: tokenData.url });
+    return res.json({
+      payment_url: tokenData.url,
+    });
 
   } catch (e) {
-    console.log(e);
-    res.status(500).json({ error: e.toString() });
+    console.log("CREATE PAYMENT ERROR:", e);
+    return res.status(500).json({ error: e.toString() });
   }
 });
 
-// WEBHOOK
+// =========================
+// WEBHOOK FEDA PAY
+// =========================
+
 app.post("/webhook", async (req, res) => {
   try {
+    console.log("WEBHOOK RECEIVED:", req.body);
+
     const transaction = req.body?.entity;
 
     if (!transaction) return res.sendStatus(200);
@@ -101,19 +152,33 @@ app.post("/webhook", async (req, res) => {
 
     if (!orderId) return res.sendStatus(200);
 
-    if (["approved", "success"].includes(transaction.status)) {
-      await db.collection("orders").doc(orderId).update({
+    const status = transaction.status;
+
+    const isPaid =
+      status === "approved" ||
+      status === "success" ||
+      status === "completed";
+
+    if (isPaid) {
+      await db.ref("orders/" + orderId).update({
         status: "paid",
-        paidAt: admin.firestore.FieldValue.serverTimestamp(),
+        paidAt: Date.now(),
       });
+
+      console.log("ORDER PAID:", orderId);
     }
 
-    res.sendStatus(200);
+    return res.sendStatus(200);
+
   } catch (e) {
-    console.log(e);
-    res.sendStatus(500);
+    console.log("WEBHOOK ERROR:", e);
+    return res.sendStatus(200);
   }
 });
+
+// =========================
+// START SERVER
+// =========================
 
 app.listen(PORT, () => {
   console.log(`Backend running on port ${PORT}`);
